@@ -645,19 +645,6 @@ impl Store {
         rows.iter().map(Stockpile::from_row).collect()
     }
 
-    /// Makes one stockpile want everything another one wants as well.
-    pub async fn copy_items(&self, from: i64, to: i64) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO stockpile_items (stockpile_id, type_id, quantity)
-             SELECT ?, type_id, quantity FROM stockpile_items WHERE stockpile_id = ?",
-        )
-        .bind(to)
-        .bind(from)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
     /// Sets whether a stockpile counts what is in ships.
     pub async fn set_count_ships(&self, id: i64, count_ships: bool) -> Result<()> {
         sqlx::query("UPDATE stockpiles SET count_ships = ? WHERE id = ?")
@@ -949,13 +936,6 @@ mod tests {
             .await?;
         let wanted: Vec<i64> = store.items(id).await?.iter().map(|i| i.quantity).collect();
         assert_eq!(wanted, vec![9, 150], "the higher of old and new");
-
-        let copy = store
-            .create_stockpile(&new_stockpile("Copy", None))
-            .await?
-            .expect("the name is free");
-        store.copy_items(id, copy).await?;
-        assert_eq!(store.items(copy).await?, store.items(id).await?);
 
         store.set_item(id, 16227, 0).await?;
         store.import_items(id, &[(34, 1)], Import::Replace).await?;

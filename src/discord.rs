@@ -60,13 +60,16 @@ You say what you want to have at a station or structure. I compare that with you
 **3. Say what you want there**
 `/stockpile paste name:Staging` opens a window. Paste item lists (`Nanite Repair Paste 500`), copies from your inventory, or EFT fits. `times:10` wants everything ten times, so one fit becomes ten ships.
 `mode` decides what happens to items the stockpile wants already: add on top, keep the higher number, or replace the whole list.
-`/stockpile set` changes a single item.
+`/stockpile set` changes a single item. `/stockpile copy` gives you the whole list as text and a file, with a button to edit it in place.
 
 **4. Get the shopping list**
 `/stockpile check` shows what is missing. The buttons under the answer give you the list for the multibuy window and in other formats.
 
-Also: `/stockpile list`, `/stockpile show`, `/stockpile copy`, `/stockpile edit`, `/stockpile delete`, `/assets characters`, `/assets unlink`.
+Also: `/stockpile list`, `/stockpile show`, `/stockpile edit`, `/stockpile delete`, `/assets characters`, `/assets unlink`.
 EVE updates asset lists once an hour, so something you just bought can still show as missing.";
+
+/// Most characters Discord takes in the text field of a window.
+const MAX_PASTE_CHARS: usize = 4000;
 
 /// Id of the text field in the paste window.
 const PASTE_FIELD: &str = "items";
@@ -267,76 +270,68 @@ impl Handler {
         }))
     }
 
-    /// Makes a new stockpile that wants the same as an existing one, at the
-    /// same place or another.
+    /// Hands out what a stockpile wants as text to edit: in the answer, as a
+    /// file, and behind a button that opens it for editing right in Discord.
     async fn copy(&self, command: &CommandInteraction) -> Outcome<EditInteractionResponse> {
-        let user = command.user.id;
-        let original = self.stockpile(command).await?;
-        let name = text(command, "new_name")?;
-        if name.starts_with('#') || name.chars().count() > MAX_NAME_LEN {
-            return say(format!(
-                "A stockpile name has 1 to {MAX_NAME_LEN} characters and does not start with #."
-            ));
+        let stockpile = self.stockpile(command).await?;
+        let items = self.app.store.items(stockpile.id).await?;
+        let header = self.describe(&stockpile).await?;
+        if items.is_empty() {
+            return Ok(reply(format!("{header} wants nothing yet.")));
         }
-        let characters = self.app.store.characters_of(user).await?;
-        if characters.is_empty() {
-            return say("Link a character first with `/assets auth`.");
+        let list = Format::Multibuy.render(&items);
+        let may_edit = self
+            .check_may_edit(&stockpile, command.user.id, command.member.as_deref())
+            .is_ok();
+
+        let mut answer = format!("{header} wants {} item types.", items.len());
+        let block = format!("\n```\n{list}```");
+        if answer.chars().count() + block.chars().count() <= MESSAGE_LIMIT - 300 {
+            answer.push_str(&block);
+        }
+        if may_edit {
+            answer.push_str(
+                "\nTo change it, edit the list and send it back with `/stockpile paste` and `mode: Replace the whole list`, pasted or as the file.",
+            );
         }
 
-        // Assets are read through the creator's characters, so a copy of
-        // someone else's stockpile counts the copier's own characters.
-        let own = original.created_by == user;
-        let source = if own {
-            original.source
-        } else {
-            Source::AllCharacters
-        };
-        let moved = option(command, "location").is_some();
-        let location_id = if moved {
-            self.location(command, &characters).await?
-        } else {
-            original.location_id
-        };
-        let guild_id = match option(command, "shared").and_then(CommandDataOptionValue::as_bool) {
-            Some(true) => match command.guild_id {
-                Some(guild_id) => Some(guild_id),
-                None => return say("A shared stockpile belongs to a server. Run this in one."),
-            },
-            Some(false) => None,
-            None => original.guild_id.filter(|_| own),
-        };
+        let file_name = format!("{}.txt", file_stem(&stockpile.name));
+        let mut response = reply(answer).new_attachment(CreateAttachment::bytes(
+            list.clone().into_bytes(),
+            file_name,
+        ));
+        if may_edit && list.chars().count() <= MAX_PASTE_CHARS {
+            let button = CreateButton::new(format!("edit:{}", stockpile.id))
+                .label("Edit here")
+                .style(ButtonStyle::Primary);
+            response = response.components(vec![CreateActionRow::Buttons(vec![button])]);
+        }
+        Ok(response)
+    }
 
-        let new = NewStockpile {
-            name,
-            created_by: user,
-            guild_id,
-            source,
-            location_id,
-            // A container or hangar belongs to the place and the assets it
-            // was picked for.
-            container: original.container.as_deref().filter(|_| !moved && own),
-            division: original.division.filter(|_| own),
-            count_ships: original.count_ships,
+    /// The Edit button under a copied list was pressed: opens the paste
+    /// window filled with what the stockpile wants now. Sending it replaces
+    /// the list. This has to be the first answer to the click.
+    async fn edit_prompt(
+        &self,
+        component: &ComponentInteraction,
+    ) -> Outcome<CreateInteractionResponse> {
+        let id: i64 = component
+            .data
+            .custom_id
+            .strip_prefix("edit:")
+            .and_then(|id| id.parse().ok())
+            .context("reading the stockpile id of an edit button")?;
+        let visible = self.visible(component.user.id, component.guild_id).await?;
+        let Some(stockpile) = visible.into_iter().find(|s| s.id == id) else {
+            return say("That stockpile is gone.");
         };
-        let Some(id) = self.app.store.create_stockpile(&new).await? else {
-            return say(format!("There is already a stockpile named {name}."));
-        };
-        self.app.store.copy_items(original.id, id).await?;
-        let copy = self
-            .app
-            .store
-            .stockpile(id)
-            .await?
-            .context("the copied stockpile is gone")?;
-        info!("{user} copied stockpile {} to {id}", original.id);
-
-        let wanted = self.app.store.items(id).await?.len();
-        Ok(reply(format!(
-            "Created {} with the {wanted} item types of **{}**, counting {}.",
-            self.describe(&copy).await?,
-            original.name,
-            self.describe_source(&copy).await?
-        )))
+        self.check_may_edit(&stockpile, component.user.id, component.member.as_ref())?;
+        let list = Format::Multibuy.render(&self.app.store.items(id).await?);
+        if list.chars().count() > MAX_PASTE_CHARS {
+            return say("The list has grown too long to edit here. Use the file instead.");
+        }
+        Ok(paste_window(&stockpile, 1, Import::Replace, Some(list)))
     }
 
     async fn create(&self, command: &CommandInteraction) -> Outcome<EditInteractionResponse> {
@@ -564,22 +559,7 @@ impl Handler {
         let stockpile = self.stockpile(command).await?;
         self.check_may_edit(&stockpile, command.user.id, command.member.as_deref())?;
         let times = integer(command, "times").unwrap_or(1);
-        let mode = match import_mode(command) {
-            Import::Add => 'a',
-            Import::KeepHigher => 'h',
-            Import::Replace => 'r',
-        };
-
-        let field =
-            CreateInputText::new(InputTextStyle::Paragraph, "Items or EFT fits", PASTE_FIELD)
-                .placeholder("Nanite Repair Paste 500\n[Ferox, Fleet fit]\n250mm Railgun II")
-                .required(true);
-        let modal = CreateModal::new(
-            format!("paste:{}:{times}:{mode}", stockpile.id),
-            cut(&format!("Paste into {}", stockpile.name), 45),
-        )
-        .components(vec![CreateActionRow::InputText(field)]);
-        Ok(CreateInteractionResponse::Modal(modal))
+        Ok(paste_window(&stockpile, times, import_mode(command), None))
     }
 
     /// The paste window was sent.
@@ -1079,6 +1059,56 @@ struct Comparison {
     anything_short: bool,
 }
 
+/// The window to paste items into. Its id carries what to do with the text.
+/// `current` fills the field in, for editing what a stockpile wants.
+fn paste_window(
+    stockpile: &Stockpile,
+    times: i64,
+    import: Import,
+    current: Option<String>,
+) -> CreateInteractionResponse {
+    let mode = match import {
+        Import::Add => 'a',
+        Import::KeepHigher => 'h',
+        Import::Replace => 'r',
+    };
+    let mut field =
+        CreateInputText::new(InputTextStyle::Paragraph, "Items or EFT fits", PASTE_FIELD)
+            .placeholder("Nanite Repair Paste 500\n[Ferox, Fleet fit]\n250mm Railgun II")
+            .required(true);
+    let title = if let Some(current) = current {
+        field = field.value(current);
+        format!("Edit {}", stockpile.name)
+    } else {
+        format!("Paste into {}", stockpile.name)
+    };
+    let modal = CreateModal::new(
+        format!("paste:{}:{times}:{mode}", stockpile.id),
+        cut(&title, 45),
+    )
+    .components(vec![CreateActionRow::InputText(field)]);
+    CreateInteractionResponse::Modal(modal)
+}
+
+/// A stockpile name as a file name: letters, digits, dashes and underscores.
+fn file_stem(name: &str) -> String {
+    let stem: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if stem.chars().any(char::is_alphanumeric) {
+        stem
+    } else {
+        "stockpile".to_owned()
+    }
+}
+
 /// Whether a server member can manage the server.
 fn may_manage(member: Option<&Member>) -> bool {
     member
@@ -1397,19 +1427,8 @@ fn commands() -> Vec<CreateCommand> {
                 )),
             )
             .add_option(
-                sub("copy", "Make a new stockpile that wants the same as another one")
-                    .add_sub_option(stockpile("The stockpile to copy"))
-                    .add_sub_option(
-                        string("new_name", "What to call the copy").required(true),
-                    )
-                    .add_sub_option(
-                        string("location", "Another station or structure, default is the same")
-                            .set_autocomplete(true),
-                    )
-                    .add_sub_option(boolean(
-                        "shared",
-                        "Let everyone in this server see and check the copy",
-                    )),
+                sub("copy", "Get what a stockpile wants as text or a file, to edit and send back")
+                    .add_sub_option(stockpile("The stockpile")),
             )
             .add_option(
                 sub("edit", "Change what a stockpile counts")
@@ -1437,6 +1456,23 @@ fn answer(what: &str, outcome: Outcome<EditInteractionResponse>) -> EditInteract
     }
 }
 
+/// The private message for when a window could not be opened, logging what broke.
+fn first_answer(what: &str, failure: Failure) -> CreateInteractionResponse {
+    let text = match failure {
+        Failure::Say(text) => text,
+        Failure::Internal(error) => {
+            error!("{what} failed: {error:#}");
+            "Something went wrong, try again in a bit.".to_owned()
+        }
+    };
+    CreateInteractionResponse::Message(
+        CreateInteractionResponseMessage::new()
+            .content(cut(&text, MESSAGE_LIMIT))
+            .allowed_mentions(CreateAllowedMentions::new())
+            .ephemeral(true),
+    )
+}
+
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
@@ -1450,6 +1486,15 @@ impl EventHandler for Handler {
         let http = &ctx.http;
         match interaction {
             Interaction::Autocomplete(command) => self.autocomplete(http, &command).await,
+            Interaction::Component(component) if component.data.custom_id.starts_with("edit:") => {
+                let response = self
+                    .edit_prompt(&component)
+                    .await
+                    .unwrap_or_else(|failure| first_answer("edit button", failure));
+                if let Err(error) = component.create_response(http, response).await {
+                    error!("could not answer the edit button: {error}");
+                }
+            }
             Interaction::Component(component) => {
                 // Reading assets from ESI can take longer than Discord waits.
                 if let Err(error) = component.defer_ephemeral(http).await {
@@ -1475,24 +1520,10 @@ impl EventHandler for Handler {
                 let name = subcommand_name(&command);
                 // The window to paste into can only be the first answer.
                 if name == "paste" && option(&command, "file").is_none() {
-                    let response = match self.paste_prompt(&command).await {
-                        Ok(response) => response,
-                        Err(failure) => {
-                            let text = match failure {
-                                Failure::Say(text) => text,
-                                Failure::Internal(error) => {
-                                    error!("command paste failed: {error:#}");
-                                    "Something went wrong, try again in a bit.".to_owned()
-                                }
-                            };
-                            CreateInteractionResponse::Message(
-                                CreateInteractionResponseMessage::new()
-                                    .content(cut(&text, MESSAGE_LIMIT))
-                                    .allowed_mentions(CreateAllowedMentions::new())
-                                    .ephemeral(true),
-                            )
-                        }
-                    };
+                    let response = self
+                        .paste_prompt(&command)
+                        .await
+                        .unwrap_or_else(|failure| first_answer("command paste", failure));
                     if let Err(error) = command.create_response(http, response).await {
                         error!("could not answer command paste: {error}");
                     }
