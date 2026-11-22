@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="42%" r="75%">
+      <stop offset="0" stop-color="#3a2a12"/>
+      <stop offset="1" stop-color="#120c05"/>
+    </radialGradient>
+    <linearGradient id="top" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffd27a"/>
+      <stop offset="1" stop-color="#f7b23b"/>
+    </linearGradient>
+    <linearGradient id="side" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#e8962a"/>
+      <stop offset="1" stop-color="#b9651a"/>
+    </linearGradient>
+    <linearGradient id="badge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5aa2ff"/>
+      <stop offset="1" stop-color="#1f5fe0"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" fill="url(#bg)"/>
+  <g stroke="#120c05" stroke-width="10" stroke-linejoin="round">
+    <polygon points="256,86 403.2,171 256,256 108.8,171" fill="url(#top)"/>
+    <polygon points="108.8,171 256,256 256,426 108.8,341" fill="url(#side)"/>
+  </g>
+  <polygon points="256,256 403.2,171 403.2,341 256,426" fill="#f7b23b" fill-opacity="0.08"
+           stroke="#f7b23b" stroke-width="9" stroke-linejoin="round" stroke-linecap="round"
+           stroke-dasharray="20 18"/>
+  <path d="M182.4 128.5 329.6 213.5M108.8 256 256 341" fill="none" stroke="#120c05"
+        stroke-opacity="0.35" stroke-width="9" stroke-linecap="round"/>
+  <circle cx="380" cy="372" r="84" fill="url(#badge)" stroke="#120c05" stroke-width="10"/>
+  <path d="M380 328v88M336 372h88" stroke="#ffffff" stroke-width="26" stroke-linecap="round"/>
+</svg>
