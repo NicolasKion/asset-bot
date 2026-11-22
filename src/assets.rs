@@ -34,6 +34,34 @@ pub struct Holding {
     pub quantity: i64,
 }
 
+/// An assembled ship with something fitted to it or loaded in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ship {
+    pub item_id: i64,
+    pub type_id: i64,
+    /// Where the ship is docked. See [`Holding`] for the fields.
+    pub location_id: i64,
+    pub division: Option<u8>,
+    pub containers: String,
+    pub contents: Vec<ShipItem>,
+}
+
+/// A stack of one type on a ship.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ShipItem {
+    pub type_id: i64,
+    /// Sits in a module, rig or subsystem slot. Loaded charges do too.
+    pub fitted: bool,
+    pub quantity: i64,
+}
+
+/// The asset tree, flattened.
+#[derive(Debug, Clone, Default)]
+pub struct Flattened {
+    pub holdings: Vec<Holding>,
+    pub ships: Vec<Ship>,
+}
+
 /// Whether a location id is one whose name `/universe/names` knows.
 pub fn has_public_name(location_id: i64) -> bool {
     STATIONS.contains(&location_id) || SOLAR_SYSTEMS.contains(&location_id)
@@ -66,9 +94,11 @@ pub fn nameable(assets: &[Asset]) -> Vec<i64> {
 ///
 /// Fitted modules and ship cargo are at the station the ship is in, marked
 /// as [`Holding::in_ship`]. Things in asset safety are left out, since they are not usable there.
-pub fn flatten(assets: &[Asset], names: &HashMap<i64, String>) -> Vec<Holding> {
+pub fn flatten(assets: &[Asset], names: &HashMap<i64, String>) -> Flattened {
     let by_id: HashMap<i64, &Asset> = assets.iter().map(|asset| (asset.item_id, asset)).collect();
     let mut totals: HashMap<Holding, i64> = HashMap::new();
+    // Ship item id to what is on it.
+    let mut aboard: HashMap<i64, HashMap<(i64, bool), i64>> = HashMap::new();
 
     for asset in assets {
         if asset.type_id == OFFICE_TYPE {
@@ -77,6 +107,13 @@ pub fn flatten(assets: &[Asset], names: &HashMap<i64, String>) -> Vec<Holding> {
         let Some(place) = locate(asset, &by_id, names) else {
             continue;
         };
+        if let Some(ship) = place.ship {
+            *aboard
+                .entry(ship)
+                .or_default()
+                .entry((asset.type_id, place.fitted))
+                .or_default() += asset.quantity;
+        }
         let key = Holding {
             location_id: place.location_id,
             division: place.division,
@@ -88,10 +125,33 @@ pub fn flatten(assets: &[Asset], names: &HashMap<i64, String>) -> Vec<Holding> {
         *totals.entry(key).or_default() += asset.quantity;
     }
 
-    totals
+    let holdings = totals
         .into_iter()
         .map(|(key, quantity)| Holding { quantity, ..key })
-        .collect()
+        .collect();
+    let ships = aboard
+        .into_iter()
+        .filter_map(|(item_id, contents)| {
+            let hull = by_id.get(&item_id)?;
+            let place = locate(hull, &by_id, names)?;
+            Some(Ship {
+                item_id,
+                type_id: hull.type_id,
+                location_id: place.location_id,
+                division: place.division,
+                containers: place.containers,
+                contents: contents
+                    .into_iter()
+                    .map(|((type_id, fitted), quantity)| ShipItem {
+                        type_id,
+                        fitted,
+                        quantity,
+                    })
+                    .collect(),
+            })
+        })
+        .collect();
+    Flattened { holdings, ships }
 }
 
 struct Place {
@@ -99,6 +159,10 @@ struct Place {
     division: Option<u8>,
     containers: String,
     in_ship: bool,
+    /// The ship the asset is on, if any: the nearest one around it.
+    ship: Option<i64>,
+    /// The asset itself sits in a fitting slot of that ship.
+    fitted: bool,
 }
 
 /// Walks from an asset up to the station, structure or solar system it is in.
@@ -111,6 +175,7 @@ fn locate(
     let mut division = None;
     let mut containers = String::new();
     let mut in_ship = false;
+    let mut ship = None;
 
     for _ in 0..MAX_DEPTH {
         if current.location_flag == "AssetSafety" {
@@ -121,7 +186,12 @@ fn locate(
         let parent = by_id.get(&current.location_id);
         // Inside another item, anything that is not plain storage is a slot,
         // bay or hold of a ship.
-        in_ship = in_ship || (parent.is_some() && !is_storage(&current.location_flag));
+        if let Some(parent) = parent
+            && !is_storage(&current.location_flag)
+        {
+            in_ship = true;
+            ship = ship.or(Some(parent.item_id));
+        }
 
         let location_id = match parent {
             // Something in space that holds items is a structure the owner
@@ -145,9 +215,18 @@ fn locate(
             division,
             containers,
             in_ship,
+            ship,
+            fitted: ship == Some(asset.location_id) && is_slot(&asset.location_flag),
         });
     }
     None
+}
+
+/// Whether a location flag is a module, rig or subsystem slot.
+fn is_slot(flag: &str) -> bool {
+    ["HiSlot", "MedSlot", "LoSlot", "RigSlot", "SubSystemSlot"]
+        .iter()
+        .any(|slot| flag.starts_with(slot))
 }
 
 /// Whether a location flag means lying in a hangar, container or office,
@@ -219,7 +298,7 @@ mod tests {
             asset(6, 34, 50, STRUCTURE, "Hangar"),
         ];
         let names = HashMap::from([(2, "Ammo Box".to_owned())]);
-        let holdings = flatten(&assets, &names);
+        let holdings = flatten(&assets, &names).holdings;
 
         assert_eq!(total(&holdings, JITA, 34), 700);
         assert_eq!(total(&holdings, JITA, 2488), 1);
@@ -246,7 +325,7 @@ mod tests {
             asset(10, OFFICE_TYPE, 1, JITA, "OfficeFolder"),
             asset(11, 3082, 2, 10, "CorpSAG1"),
         ];
-        let holdings = flatten(&assets, &HashMap::new());
+        let holdings = flatten(&assets, &HashMap::new()).holdings;
         let in_ship = |type_id| -> i64 {
             holdings
                 .iter()
@@ -264,6 +343,25 @@ mod tests {
         assert_eq!(total(&holdings, JITA, 3082), 7);
         assert_eq!(in_ship(2488), 5);
         assert_eq!(in_ship(34), 10, "in a container in the cargo hold");
+
+        let ships = flatten(&assets, &HashMap::new()).ships;
+        assert_eq!(ships.len(), 1);
+        let ferox = &ships[0];
+        assert_eq!(
+            (ferox.item_id, ferox.type_id, ferox.location_id),
+            (1, 16227, JITA)
+        );
+        let aboard = |type_id, fitted| -> i64 {
+            ferox
+                .contents
+                .iter()
+                .filter(|item| item.type_id == type_id && item.fitted == fitted)
+                .map(|item| item.quantity)
+                .sum()
+        };
+        assert_eq!(aboard(3082, true), 1);
+        assert_eq!(aboard(2488, false), 5, "drones are aboard but not fitted");
+        assert_eq!(aboard(34, false), 10);
     }
 
     #[test]
@@ -274,7 +372,7 @@ mod tests {
             asset(12, 3293, 1, 10, "CorpSAG3"),
             asset(13, 34, 7, 12, "Unlocked"),
         ];
-        let holdings = flatten(&assets, &HashMap::new());
+        let holdings = flatten(&assets, &HashMap::new()).holdings;
 
         assert_eq!(total(&holdings, STRUCTURE, 34), 107);
         assert_eq!(total(&holdings, STRUCTURE, OFFICE_TYPE), 0);
@@ -292,7 +390,7 @@ mod tests {
             asset(21, OFFICE_TYPE, 1, STRUCTURE, "OfficeFolder"),
             asset(22, 34, 9, 21, "CorpSAG1"),
         ];
-        let holdings = flatten(&assets, &HashMap::new());
+        let holdings = flatten(&assets, &HashMap::new()).holdings;
 
         assert_eq!(total(&holdings, STRUCTURE, 4247), 300);
         assert_eq!(total(&holdings, STRUCTURE, 34), 9);
@@ -305,7 +403,7 @@ mod tests {
             asset(30, 60, 1, JITA, "AssetSafety"),
             asset(31, 34, 5, 30, "Hangar"),
         ];
-        assert!(flatten(&assets, &HashMap::new()).is_empty());
+        assert!(flatten(&assets, &HashMap::new()).holdings.is_empty());
     }
 
     #[test]

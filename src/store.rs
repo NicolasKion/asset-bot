@@ -8,7 +8,7 @@ use serenity::model::id::{GuildId, UserId};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
 
-use crate::assets::{self, Holding};
+use crate::assets::{self, Holding, Ship};
 use crate::esi::Owner;
 
 const SCHEMA: &str = "
@@ -39,6 +39,26 @@ CREATE TABLE IF NOT EXISTS holdings (
 );
 CREATE INDEX IF NOT EXISTS holdings_by_place
     ON holdings (owner_kind, owner_id, location_id);
+CREATE TABLE IF NOT EXISTS ships (
+    owner_kind  TEXT    NOT NULL,
+    owner_id    INTEGER NOT NULL,
+    item_id     INTEGER NOT NULL,
+    type_id     INTEGER NOT NULL,
+    location_id INTEGER NOT NULL,
+    division    INTEGER,
+    containers  TEXT    NOT NULL,
+    PRIMARY KEY (owner_kind, owner_id, item_id)
+);
+CREATE TABLE IF NOT EXISTS ship_items (
+    owner_kind TEXT    NOT NULL,
+    owner_id   INTEGER NOT NULL,
+    ship_id    INTEGER NOT NULL,
+    type_id    INTEGER NOT NULL,
+    fitted     INTEGER NOT NULL,
+    quantity   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ship_items_by_ship
+    ON ship_items (owner_kind, owner_id, ship_id);
 CREATE TABLE IF NOT EXISTS names (
     id         INTEGER PRIMARY KEY,
     name       TEXT,
@@ -70,6 +90,25 @@ CREATE TABLE IF NOT EXISTS stockpile_items (
     type_id      INTEGER NOT NULL,
     quantity     INTEGER NOT NULL,
     PRIMARY KEY (stockpile_id, type_id)
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS fits (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    stockpile_id INTEGER NOT NULL REFERENCES stockpiles (id) ON DELETE CASCADE,
+    name         TEXT    NOT NULL COLLATE NOCASE,
+    hull_type_id INTEGER NOT NULL,
+    quantity     INTEGER NOT NULL,
+    UNIQUE (stockpile_id, name)
+);
+CREATE TABLE IF NOT EXISTS fit_items (
+    fit_id   INTEGER NOT NULL REFERENCES fits (id) ON DELETE CASCADE,
+    type_id  INTEGER NOT NULL,
+    part     INTEGER NOT NULL,
+    quantity INTEGER NOT NULL,
+    PRIMARY KEY (fit_id, type_id, part)
 );
 ";
 
@@ -252,7 +291,28 @@ impl Store {
             .max_connections(1)
             .connect_with(options)
             .await?;
+        // The first version of fits only told fitted modules from the rest.
+        let old_fit_items =
+            sqlx::query("SELECT 1 FROM pragma_table_info('fit_items') WHERE name = 'fitted'")
+                .fetch_optional(&pool)
+                .await?
+                .is_some();
+        if old_fit_items {
+            sqlx::raw_sql("ALTER TABLE fit_items RENAME COLUMN fitted TO part")
+                .execute(&pool)
+                .await?;
+        }
+        let knows_ships = sqlx::query("SELECT 1 FROM sqlite_master WHERE name = 'ships'")
+            .fetch_optional(&pool)
+            .await?
+            .is_some();
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
+        if !knows_ships {
+            // Snapshots from before ships were recorded have to be read again.
+            sqlx::raw_sql("DELETE FROM asset_sync")
+                .execute(&pool)
+                .await?;
+        }
         for (table, column, statement) in ADDED_COLUMNS {
             let exists = sqlx::query("SELECT 1 FROM pragma_table_info(?) WHERE name = ?")
                 .bind(table)
@@ -399,10 +459,11 @@ impl Store {
     }
 
     /// Replaces everything cached for an owner with a fresh snapshot.
-    pub async fn replace_holdings(
+    pub async fn replace_assets(
         &self,
         owner: Owner,
         holdings: &[Holding],
+        ships: &[Ship],
         fetched_at: i64,
     ) -> Result<()> {
         let (kind, id) = owner_parts(owner);
@@ -428,6 +489,47 @@ impl Store {
             .bind(holding.quantity)
             .execute(&mut *tx)
             .await?;
+        }
+        for table in [
+            "DELETE FROM ships WHERE owner_kind = ? AND owner_id = ?",
+            "DELETE FROM ship_items WHERE owner_kind = ? AND owner_id = ?",
+        ] {
+            sqlx::query(table)
+                .bind(kind)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        for ship in ships {
+            sqlx::query(
+                "INSERT INTO ships
+                     (owner_kind, owner_id, item_id, type_id, location_id, division, containers)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(kind)
+            .bind(id)
+            .bind(ship.item_id)
+            .bind(ship.type_id)
+            .bind(ship.location_id)
+            .bind(ship.division)
+            .bind(&ship.containers)
+            .execute(&mut *tx)
+            .await?;
+            for item in &ship.contents {
+                sqlx::query(
+                    "INSERT INTO ship_items
+                         (owner_kind, owner_id, ship_id, type_id, fitted, quantity)
+                     VALUES (?, ?, ?, ?, ?, ?)",
+                )
+                .bind(kind)
+                .bind(id)
+                .bind(ship.item_id)
+                .bind(item.type_id)
+                .bind(item.fitted)
+                .bind(item.quantity)
+                .execute(&mut *tx)
+                .await?;
+            }
         }
         sqlx::query(
             "INSERT INTO asset_sync (owner_kind, owner_id, fetched_at) VALUES (?, ?, ?)
@@ -476,6 +578,66 @@ impl Store {
             }
         }
         Ok(stock)
+    }
+
+    /// The assembled ships of the given hull types the owners have where the
+    /// stockpile counts, with what is on them.
+    pub async fn docked_ships(
+        &self,
+        owners: &[Owner],
+        stockpile: &Stockpile,
+        hulls: &[i64],
+    ) -> Result<Vec<DockedShip>> {
+        let container = stockpile.container.as_deref().map(assets::container_key);
+        let mut ships = Vec::new();
+        for &owner in owners {
+            let (kind, id) = owner_parts(owner);
+            let rows = sqlx::query(
+                "SELECT item_id, type_id FROM ships
+                 WHERE owner_kind = ?1 AND owner_id = ?2 AND location_id = ?3
+                   AND (?4 IS NULL OR division = ?4)
+                   AND (?5 IS NULL OR instr(containers, ?5) > 0)
+                 ORDER BY item_id",
+            )
+            .bind(kind)
+            .bind(id)
+            .bind(stockpile.location_id)
+            .bind(stockpile.division)
+            .bind(container.as_deref())
+            .fetch_all(&self.pool)
+            .await?;
+            for row in rows {
+                let type_id: i64 = row.try_get("type_id")?;
+                if !hulls.contains(&type_id) {
+                    continue;
+                }
+                let item_id: i64 = row.try_get("item_id")?;
+                let mut ship = DockedShip {
+                    type_id,
+                    fitted: HashMap::new(),
+                    contents: HashMap::new(),
+                };
+                let items = sqlx::query(
+                    "SELECT type_id, fitted, quantity FROM ship_items
+                     WHERE owner_kind = ? AND owner_id = ? AND ship_id = ?",
+                )
+                .bind(kind)
+                .bind(id)
+                .bind(item_id)
+                .fetch_all(&self.pool)
+                .await?;
+                for item in items {
+                    let item_type: i64 = item.try_get("type_id")?;
+                    let quantity: i64 = item.try_get("quantity")?;
+                    if item.try_get("fitted")? {
+                        *ship.fitted.entry(item_type).or_default() += quantity;
+                    }
+                    *ship.contents.entry(item_type).or_default() += quantity;
+                }
+                ships.push(ship);
+            }
+        }
+        Ok(ships)
     }
 
     /// The locations the owners have assets at, with the name if it is known.
@@ -551,6 +713,28 @@ impl Store {
         .bind(id)
         .bind(name)
         .bind(checked_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // Settings
+
+    pub async fn setting(&self, key: &'static str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT value FROM settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|row| row.try_get("value")).transpose()?)
+    }
+
+    pub async fn set_setting(&self, key: &'static str, value: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES (?, ?)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(value)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -709,7 +893,7 @@ impl Store {
     }
 
     /// Puts quantities into a stockpile. `import` says what happens to the
-    /// quantities it wants already.
+    /// quantities it wants already. Replacing also forgets the wanted fits.
     pub async fn import_items(
         &self,
         stockpile_id: i64,
@@ -718,10 +902,15 @@ impl Store {
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         if import == Import::Replace {
-            sqlx::query("DELETE FROM stockpile_items WHERE stockpile_id = ?")
-                .bind(stockpile_id)
-                .execute(&mut *tx)
-                .await?;
+            for table in [
+                "DELETE FROM stockpile_items WHERE stockpile_id = ?",
+                "DELETE FROM fits WHERE stockpile_id = ?",
+            ] {
+                sqlx::query(table)
+                    .bind(stockpile_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
         }
         let statement = match import {
             Import::Add | Import::Replace => {
@@ -746,6 +935,196 @@ impl Store {
         tx.commit().await?;
         Ok(())
     }
+}
+
+impl Store {
+    /// Makes a stockpile want ships of a fit. A fit it knows by that name
+    /// gets the new modules, and `import` says what happens to its quantity.
+    pub async fn import_fit(
+        &self,
+        stockpile_id: i64,
+        fit: &NewFit<'_>,
+        import: Import,
+    ) -> Result<()> {
+        let statement = match import {
+            Import::Add => {
+                "INSERT INTO fits (stockpile_id, name, hull_type_id, quantity) VALUES (?, ?, ?, ?)
+                 ON CONFLICT (stockpile_id, name) DO UPDATE SET
+                     hull_type_id = excluded.hull_type_id,
+                     quantity = fits.quantity + excluded.quantity
+                 RETURNING id"
+            }
+            Import::KeepHigher => {
+                "INSERT INTO fits (stockpile_id, name, hull_type_id, quantity) VALUES (?, ?, ?, ?)
+                 ON CONFLICT (stockpile_id, name) DO UPDATE SET
+                     hull_type_id = excluded.hull_type_id,
+                     quantity = MAX(fits.quantity, excluded.quantity)
+                 RETURNING id"
+            }
+            Import::Replace => {
+                "INSERT INTO fits (stockpile_id, name, hull_type_id, quantity) VALUES (?, ?, ?, ?)
+                 ON CONFLICT (stockpile_id, name) DO UPDATE SET
+                     hull_type_id = excluded.hull_type_id,
+                     quantity = excluded.quantity
+                 RETURNING id"
+            }
+        };
+        let mut tx = self.pool.begin().await?;
+        let fit_id: i64 = sqlx::query(statement)
+            .bind(stockpile_id)
+            .bind(fit.name)
+            .bind(fit.hull_type_id)
+            .bind(fit.quantity)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get("id")?;
+        sqlx::query("DELETE FROM fit_items WHERE fit_id = ?")
+            .bind(fit_id)
+            .execute(&mut *tx)
+            .await?;
+        let parts = [
+            (fit.fitted, PART_FITTED),
+            (fit.carried, PART_CARRIED),
+            (fit.loaded, PART_LOADED),
+        ];
+        for (items, part) in parts {
+            for &(type_id, quantity) in items {
+                sqlx::query(
+                    "INSERT INTO fit_items (fit_id, type_id, part, quantity) VALUES (?, ?, ?, ?)",
+                )
+                .bind(fit_id)
+                .bind(type_id)
+                .bind(part)
+                .bind(quantity)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The fits a stockpile wants ships of, sorted by name.
+    pub async fn fits(&self, stockpile_id: i64) -> Result<Vec<Fit>> {
+        let rows = sqlx::query(
+            "SELECT f.id, f.name, f.hull_type_id, f.quantity,
+                    COALESCE(t.name, 'Type ' || f.hull_type_id) AS hull_name
+             FROM fits f
+             LEFT JOIN types t ON t.type_id = f.hull_type_id
+             WHERE f.stockpile_id = ?
+             ORDER BY f.name",
+        )
+        .bind(stockpile_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut fits = Vec::with_capacity(rows.len());
+        for row in rows {
+            let fit_id: i64 = row.try_get("id")?;
+            let parts = sqlx::query(
+                "SELECT i.type_id, i.part, i.quantity,
+                        COALESCE(t.name, 'Type ' || i.type_id) AS name
+                 FROM fit_items i
+                 LEFT JOIN types t ON t.type_id = i.type_id
+                 WHERE i.fit_id = ?
+                 ORDER BY name",
+            )
+            .bind(fit_id)
+            .fetch_all(&self.pool)
+            .await?;
+            let mut fit = Fit {
+                name: row.try_get("name")?,
+                hull_type_id: row.try_get("hull_type_id")?,
+                hull_name: row.try_get("hull_name")?,
+                wanted: row.try_get("quantity")?,
+                fitted: Vec::new(),
+                carried: Vec::new(),
+                loaded: Vec::new(),
+            };
+            for part in parts {
+                let item = Item {
+                    type_id: part.try_get("type_id")?,
+                    name: part.try_get("name")?,
+                    quantity: part.try_get("quantity")?,
+                };
+                match part.try_get::<i64, _>("part")? {
+                    PART_FITTED => fit.fitted.push(item),
+                    PART_CARRIED => fit.carried.push(item),
+                    _ => fit.loaded.push(item),
+                }
+            }
+            fits.push(fit);
+        }
+        Ok(fits)
+    }
+
+    /// Sets how many ships of a fit a stockpile wants. Zero removes the fit.
+    /// Returns false if the stockpile has no fit with that name.
+    pub async fn set_fit_quantity(
+        &self,
+        stockpile_id: i64,
+        name: &str,
+        quantity: i64,
+    ) -> Result<bool> {
+        let result = if quantity <= 0 {
+            sqlx::query("DELETE FROM fits WHERE stockpile_id = ? AND name = ?")
+                .bind(stockpile_id)
+                .bind(name)
+                .execute(&self.pool)
+                .await?
+        } else {
+            sqlx::query("UPDATE fits SET quantity = ? WHERE stockpile_id = ? AND name = ?")
+                .bind(quantity)
+                .bind(stockpile_id)
+                .bind(name)
+                .execute(&self.pool)
+                .await?
+        };
+        Ok(result.rows_affected() > 0)
+    }
+}
+
+/// A fit a stockpile wants ships of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fit {
+    pub name: String,
+    pub hull_type_id: i64,
+    pub hull_name: String,
+    /// How many ships of the fit should be there.
+    pub wanted: i64,
+    /// Modules, rigs and subsystems, per ship. They have to sit in the
+    /// ship's slots.
+    pub fitted: Vec<Item>,
+    /// Drones and cargo, per ship. They have to be aboard.
+    pub carried: Vec<Item>,
+    /// Charges loaded in modules, per ship. Not looked at on a ship, since
+    /// ESI is unreliable about them, only bought along with a ship that is
+    /// missing entirely.
+    pub loaded: Vec<Item>,
+}
+
+/// A fit that is about to be stored, with type ids and quantities per ship.
+pub struct NewFit<'a> {
+    pub name: &'a str,
+    pub hull_type_id: i64,
+    pub quantity: i64,
+    pub fitted: &'a [(i64, i64)],
+    pub carried: &'a [(i64, i64)],
+    pub loaded: &'a [(i64, i64)],
+}
+
+/// How `fit_items.part` says what a line of a fit is on the ship.
+const PART_LOADED: i64 = 0;
+const PART_FITTED: i64 = 1;
+const PART_CARRIED: i64 = 2;
+
+/// An assembled ship where a stockpile counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockedShip {
+    pub type_id: i64,
+    /// What sits in its slots, by type id.
+    pub fitted: HashMap<i64, i64>,
+    /// Everything on it, the fitted things included, by type id.
+    pub contents: HashMap<i64, i64>,
 }
 
 /// What a pasted list does with the items a stockpile already wants.
@@ -807,16 +1186,18 @@ mod tests {
         let pilot = Owner::Character(10);
         let corporation = Owner::Corporation(20);
         store
-            .replace_holdings(
+            .replace_assets(
                 pilot,
                 &[holding(None, "", 34, 100), holding(None, "Ammo Box", 34, 5)],
+                &[],
                 1,
             )
             .await?;
         store
-            .replace_holdings(
+            .replace_assets(
                 corporation,
                 &[holding(Some(2), "", 34, 1000), holding(Some(3), "", 34, 7)],
+                &[],
                 1,
             )
             .await?;
@@ -845,7 +1226,7 @@ mod tests {
             ..holding(None, "", 34, 40)
         };
         store
-            .replace_holdings(Owner::Character(11), &[fitted], 1)
+            .replace_assets(Owner::Character(11), &[fitted], &[], 1)
             .await?;
         stockpile.division = None;
         let without = store.stock(&[Owner::Character(11)], &stockpile).await?;
@@ -855,7 +1236,7 @@ mod tests {
         assert_eq!(with.get(&34), Some(&40));
 
         // A new snapshot replaces the old one.
-        store.replace_holdings(pilot, &[], 2).await?;
+        store.replace_assets(pilot, &[], &[], 2).await?;
         stockpile.division = None;
         let later = store.stock(&[pilot], &stockpile).await?;
         assert_eq!(later.get(&34), None);
@@ -949,6 +1330,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fits_and_docked_ships() -> Result<()> {
+        use crate::assets::ShipItem;
+
+        let store = store().await;
+        store
+            .add_types(&[
+                (16227, "Ferox".to_owned()),
+                (3082, "250mm Railgun II".to_owned()),
+            ])
+            .await?;
+        let id = store
+            .create_stockpile(&new_stockpile("Staging", None))
+            .await?
+            .expect("the name is free");
+        let fit = NewFit {
+            name: "Fleet Ferox",
+            hull_type_id: 16227,
+            quantity: 10,
+            fitted: &[(3082, 7)],
+            carried: &[(2488, 5), (21898, 2000)],
+            loaded: &[(21898, 7)],
+        };
+        store.import_fit(id, &fit, Import::Add).await?;
+        store.import_fit(id, &fit, Import::Add).await?;
+        store
+            .import_fit(id, &NewFit { quantity: 5, ..fit }, Import::KeepHigher)
+            .await?;
+
+        let fits = store.fits(id).await?;
+        assert_eq!(fits.len(), 1);
+        assert_eq!(fits[0].wanted, 20);
+        assert_eq!(fits[0].hull_name, "Ferox");
+        assert_eq!(fits[0].fitted[0].name, "250mm Railgun II");
+        assert_eq!(
+            fits[0].fitted[0].quantity, 7,
+            "parts are per ship and not added up"
+        );
+        assert_eq!(fits[0].carried[1].name, "Type 2488");
+        assert_eq!(fits[0].carried[0].quantity, 2000, "ammo in the cargo");
+        assert_eq!(fits[0].loaded[0].quantity, 7, "the same ammo, loaded");
+
+        assert!(store.set_fit_quantity(id, "fleet ferox", 3).await?);
+        assert_eq!(store.fits(id).await?[0].wanted, 3);
+        assert!(!store.set_fit_quantity(id, "Other", 3).await?);
+
+        let ship = Ship {
+            item_id: 1,
+            type_id: 16227,
+            location_id: JITA,
+            division: None,
+            containers: String::new(),
+            contents: vec![
+                ShipItem {
+                    type_id: 3082,
+                    fitted: true,
+                    quantity: 7,
+                },
+                ShipItem {
+                    type_id: 2488,
+                    fitted: false,
+                    quantity: 5,
+                },
+            ],
+        };
+        let other_hull = Ship {
+            item_id: 2,
+            type_id: 999,
+            ..ship.clone()
+        };
+        let pilot = Owner::Character(10);
+        store
+            .replace_assets(pilot, &[], &[ship, other_hull], 1)
+            .await?;
+        let stockpile = store.stockpile(id).await?.expect("it exists");
+        let docked = store.docked_ships(&[pilot], &stockpile, &[16227]).await?;
+        assert_eq!(docked.len(), 1);
+        assert_eq!(docked[0].fitted.get(&3082), Some(&7));
+        assert_eq!(docked[0].fitted.get(&2488), None);
+        assert_eq!(docked[0].contents.get(&2488), Some(&5));
+
+        // A new snapshot without the ship forgets it.
+        store.replace_assets(pilot, &[], &[], 2).await?;
+        assert!(
+            store
+                .docked_ships(&[pilot], &stockpile, &[16227])
+                .await?
+                .is_empty()
+        );
+
+        store.import_items(id, &[], Import::Replace).await?;
+        assert!(
+            store.fits(id).await?.is_empty(),
+            "replacing forgets fits too"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn characters_and_names() -> Result<()> {
         let store = store().await;
         store
@@ -956,7 +1435,7 @@ mod tests {
             .await?;
         store.set_corporation(10, 20).await?;
         store
-            .replace_holdings(Owner::Character(10), &[holding(None, "", 34, 1)], 1)
+            .replace_assets(Owner::Character(10), &[holding(None, "", 34, 1)], &[], 1)
             .await?;
 
         let characters = store.characters_of(USER).await?;

@@ -371,10 +371,10 @@ impl App {
             }
         };
 
-        let holdings = assets::flatten(&listed, &names);
+        let assets::Flattened { holdings, ships } = assets::flatten(&listed, &names);
         let fetched_at = now();
         self.store
-            .replace_holdings(owner, &holdings, fetched_at)
+            .replace_assets(owner, &holdings, &ships, fetched_at)
             .await?;
 
         if let Err(error) = self.name_locations(&holdings, &names, &token).await {

@@ -19,10 +19,10 @@ use tracing::{error, info, warn};
 use crate::app::{App, LoginScopes};
 use crate::assets;
 use crate::esi::{EsiError, MIN_SEARCH_LEN, Owner};
-use crate::parse::{self, Line};
-use crate::shopping::{self, Format};
+use crate::parse::{self, Line, Part};
+use crate::shopping::{self, FitPlan, Format};
 use crate::sso::RefreshError;
-use crate::store::{Character, Import, Item, NewStockpile, Source, Stockpile};
+use crate::store::{Character, Fit, Import, Item, NewFit, NewStockpile, Source, Stockpile};
 
 /// Discord takes 2000 characters per message. This leaves room for the cut mark.
 const MESSAGE_LIMIT: usize = 1900;
@@ -60,6 +60,7 @@ You say what you want to have at a station or structure. I compare that with you
 **3. Say what you want there**
 `/stockpile paste name:Staging` opens a window. Paste item lists (`Nanite Repair Paste 500`), copies from your inventory, or EFT fits. `times:10` wants everything ten times, so one fit becomes ten ships.
 `mode` decides what happens to items the stockpile wants already: add on top, keep the higher number, or replace the whole list.
+`fits: As fitted ships` wants ships with the fit's modules fitted and its drones and cargo aboard, whatever they are called, instead of just the parts.
 `/stockpile set` changes a single item. `/stockpile copy` gives you the whole list as text and a file, with a button to edit it in place.
 
 **4. Get the shopping list**
@@ -144,6 +145,7 @@ impl Handler {
             ("assets", "guide") => self.guide(http, command).await,
             ("stockpile", "edit") => self.edit(command).await,
             ("stockpile", "copy") => self.copy(command).await,
+            ("stockpile", "fit") => self.fit(command).await,
             ("assets", "auth") => self.auth(command),
             ("assets", "characters") => self.characters(command.user.id).await,
             ("assets", "unlink") => self.unlink(command).await,
@@ -275,16 +277,17 @@ impl Handler {
     async fn copy(&self, command: &CommandInteraction) -> Outcome<EditInteractionResponse> {
         let stockpile = self.stockpile(command).await?;
         let items = self.app.store.items(stockpile.id).await?;
+        let fits = self.app.store.fits(stockpile.id).await?;
         let header = self.describe(&stockpile).await?;
-        if items.is_empty() {
+        if items.is_empty() && fits.is_empty() {
             return Ok(reply(format!("{header} wants nothing yet.")));
         }
-        let list = Format::Multibuy.render(&items);
+        let list = wanted_text(&items, &fits);
         let may_edit = self
             .check_may_edit(&stockpile, command.user.id, command.member.as_deref())
             .is_ok();
 
-        let mut answer = format!("{header} wants {} item types.", items.len());
+        let mut answer = format!("{header} wants {}.", wanted_summary(&items, &fits));
         let block = format!("\n```\n{list}```");
         if answer.chars().count() + block.chars().count() <= MESSAGE_LIMIT - 300 {
             answer.push_str(&block);
@@ -293,6 +296,9 @@ impl Handler {
             answer.push_str(
                 "\nTo change it, edit the list and send it back with `/stockpile paste` and `mode: Replace the whole list`, pasted or as the file.",
             );
+            if !fits.is_empty() {
+                answer.push_str(" Add `fits: As fitted ships` so the fits stay fits.");
+            }
         }
 
         let file_name = format!("{}.txt", file_stem(&stockpile.name));
@@ -307,6 +313,34 @@ impl Handler {
             response = response.components(vec![CreateActionRow::Buttons(vec![button])]);
         }
         Ok(response)
+    }
+
+    /// Sets how many ships of a fit a stockpile wants.
+    async fn fit(&self, command: &CommandInteraction) -> Outcome<EditInteractionResponse> {
+        let stockpile = self.stockpile(command).await?;
+        self.check_may_edit(&stockpile, command.user.id, command.member.as_deref())?;
+        let name = text(command, "fit")?;
+        let quantity =
+            integer(command, "quantity").context("the fit command came without a quantity")?;
+        if !self
+            .app
+            .store
+            .set_fit_quantity(stockpile.id, name, quantity)
+            .await?
+        {
+            return say(format!(
+                "**{}** has no fit named {name}. Add fits with `/stockpile paste` and `fits: As fitted ships`.",
+                stockpile.name
+            ));
+        }
+        Ok(reply(if quantity > 0 {
+            format!(
+                "**{}** wants {quantity} ships of {name} now.",
+                stockpile.name
+            )
+        } else {
+            format!("**{}** no longer wants {name}.", stockpile.name)
+        }))
     }
 
     /// The Edit button under a copied list was pressed: opens the paste
@@ -327,11 +361,21 @@ impl Handler {
             return say("That stockpile is gone.");
         };
         self.check_may_edit(&stockpile, component.user.id, component.member.as_ref())?;
-        let list = Format::Multibuy.render(&self.app.store.items(id).await?);
+        let fits = self.app.store.fits(id).await?;
+        let list = wanted_text(&self.app.store.items(id).await?, &fits);
         if list.chars().count() > MAX_PASTE_CHARS {
             return say("The list has grown too long to edit here. Use the file instead.");
         }
-        Ok(paste_window(&stockpile, 1, Import::Replace, Some(list)))
+        let job = PasteJob {
+            times: 1,
+            import: Import::Replace,
+            fits: if fits.is_empty() {
+                FitsAs::Parts
+            } else {
+                FitsAs::Ships
+            },
+        };
+        Ok(paste_window(&stockpile, job, Some(list)))
     }
 
     async fn create(&self, command: &CommandInteraction) -> Outcome<EditInteractionResponse> {
@@ -535,14 +579,15 @@ impl Handler {
     async fn show(&self, command: &CommandInteraction) -> Outcome<EditInteractionResponse> {
         let stockpile = self.stockpile(command).await?;
         let items = self.app.store.items(stockpile.id).await?;
+        let fits = self.app.store.fits(stockpile.id).await?;
         let header = self.describe(&stockpile).await?;
-        if items.is_empty() {
+        if items.is_empty() && fits.is_empty() {
             return Ok(reply(format!("{header} wants nothing yet.")));
         }
         Ok(listing(
             &[Section {
-                header: format!("{header} wants {} item types:", items.len()),
-                list: Format::Multibuy.render(&items),
+                header: format!("{header} wants {}:", wanted_summary(&items, &fits)),
+                list: wanted_text(&items, &fits),
             }],
             "stockpile.txt",
             "",
@@ -558,24 +603,35 @@ impl Handler {
     ) -> Outcome<CreateInteractionResponse> {
         let stockpile = self.stockpile(command).await?;
         self.check_may_edit(&stockpile, command.user.id, command.member.as_deref())?;
-        let times = integer(command, "times").unwrap_or(1);
-        Ok(paste_window(&stockpile, times, import_mode(command), None))
+        Ok(paste_window(&stockpile, paste_job(command), None))
     }
 
     /// The paste window was sent.
     async fn pasted(&self, modal: &ModalInteraction) -> Outcome<EditInteractionResponse> {
         let mut parts = modal.data.custom_id.split(':');
-        let (Some("paste"), Some(id), Some(times), Some(mode)) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
+        let (Some("paste"), Some(id), Some(times), Some(mode), fits) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
             return Err(anyhow!("unknown window {}", modal.data.custom_id).into());
         };
         let id: i64 = id.parse().context("reading the stockpile id")?;
         let times: i64 = times.parse().context("reading the multiplier")?;
-        let import = match mode {
-            "h" => Import::KeepHigher,
-            "r" => Import::Replace,
-            _ => Import::Add,
+        let job = PasteJob {
+            times,
+            import: match mode {
+                "h" => Import::KeepHigher,
+                "r" => Import::Replace,
+                _ => Import::Add,
+            },
+            fits: if fits == Some("s") {
+                FitsAs::Ships
+            } else {
+                FitsAs::Parts
+            },
         };
 
         let visible = self.visible(modal.user.id, modal.guild_id).await?;
@@ -596,7 +652,7 @@ impl Handler {
                 _ => None,
             })
             .unwrap_or_default();
-        let answer = self.import(&stockpile, pasted, times, import).await?;
+        let answer = self.import(&stockpile, pasted, job).await?;
         Ok(reply(answer))
     }
 
@@ -628,66 +684,129 @@ impl Handler {
             return say("That file is not plain text.");
         };
 
-        let times = integer(command, "times").unwrap_or(1);
-        let import = import_mode(command);
-        let answer = self.import(&stockpile, pasted, times, import).await?;
+        let answer = self.import(&stockpile, pasted, paste_job(command)).await?;
         Ok(reply(answer))
     }
 
     /// Puts a pasted list into a stockpile and says what happened.
-    async fn import(
-        &self,
-        stockpile: &Stockpile,
-        pasted: &str,
-        times: i64,
-        import: Import,
-    ) -> Outcome<String> {
-        let lines = parse::parse(pasted);
-        if lines.is_empty() {
+    async fn import(&self, stockpile: &Stockpile, pasted: &str, job: PasteJob) -> Outcome<String> {
+        let pasted = parse::parse_fits(pasted);
+        let line_count = pasted.loose.len()
+            + pasted
+                .fits
+                .iter()
+                .map(|fit| fit.lines.len() + 1)
+                .sum::<usize>();
+        if line_count == 0 {
             return say("I found no items in that.");
         }
-        if lines.len() > MAX_LINES {
+        if line_count > MAX_LINES {
             return say(format!(
                 "That is too long. I take up to {MAX_LINES} lines at once."
             ));
         }
-        let resolved = self.app.resolve(&lines, times.max(1)).await?;
-        let skipped = match resolved.unknown.as_slice() {
-            [] => String::new(),
-            unknown => {
-                let names: Vec<&str> = unknown
-                    .iter()
-                    .take(MAX_LISTED)
-                    .map(String::as_str)
-                    .collect();
-                let more = match unknown.len().saturating_sub(names.len()) {
-                    0 => String::new(),
-                    more => format!(" and {more} more"),
-                };
-                format!(
-                    "\nEVE knows no item with these names, so I skipped them: {}{more}",
-                    names.join(", ")
-                )
-            }
-        };
-        if resolved.items.is_empty() {
-            return say(format!("Nothing changed.{skipped}"));
-        }
-
-        self.app
-            .store
-            .import_items(stockpile.id, &resolved.items, import)
-            .await?;
-        let wanted = self.app.store.items(stockpile.id).await?.len();
-        let verb = match import {
+        let times = job.times.max(1);
+        let verb = match job.import {
             Import::Add => "Added",
             Import::KeepHigher => "Merged in",
             Import::Replace => "Replaced the list with",
         };
+
+        if job.fits == FitsAs::Parts || pasted.fits.is_empty() {
+            let resolved = self.app.resolve(&pasted.into_lines(), times).await?;
+            let skipped = skipped_note(&resolved.unknown);
+            if resolved.items.is_empty() {
+                return say(format!("Nothing changed.{skipped}"));
+            }
+            self.app
+                .store
+                .import_items(stockpile.id, &resolved.items, job.import)
+                .await?;
+            let wanted = self.app.store.items(stockpile.id).await?.len();
+            return Ok(format!(
+                "{verb} {} item types. **{}** wants {wanted} item types now. `/stockpile check` shows what is missing.{skipped}",
+                resolved.items.len(),
+                stockpile.name
+            ));
+        }
+
+        // Everything is looked up before anything is stored, so a failed
+        // lookup cannot leave a half replaced list behind.
+        let mut unknown = Vec::new();
+        let loose = self.app.resolve(&pasted.loose, times).await?;
+        unknown.extend(loose.unknown);
+        let mut fits = Vec::new();
+        for fit in &pasted.fits {
+            let hull = Line {
+                name: fit.hull.clone(),
+                quantity: 1,
+                whole: None,
+            };
+            let Some(&(hull_type_id, _)) = self.app.resolve(&[hull], 1).await?.items.first() else {
+                unknown.push(format!("{} (a hull, so I skipped its whole fit)", fit.hull));
+                continue;
+            };
+            let lines = |part: Part| -> Vec<Line> {
+                fit.lines
+                    .iter()
+                    .filter(|line| line.part == part)
+                    .map(|line| line.line.clone())
+                    .collect()
+            };
+            let fitted = self.app.resolve(&lines(Part::Fitted), 1).await?;
+            let carried = self.app.resolve(&lines(Part::Carried), 1).await?;
+            let loaded = self.app.resolve(&lines(Part::Loaded), 1).await?;
+            unknown.extend(fitted.unknown);
+            unknown.extend(carried.unknown);
+            unknown.extend(loaded.unknown);
+            let name = if fit.name.is_empty() {
+                &fit.hull
+            } else {
+                &fit.name
+            };
+            fits.push((
+                cut(name, MAX_NAME_LEN),
+                hull_type_id,
+                fit.count.saturating_mul(times),
+                fitted.items,
+                carried.items,
+                loaded.items,
+            ));
+        }
+        unknown.dedup();
+        let skipped = skipped_note(&unknown);
+        if fits.is_empty() && loose.items.is_empty() {
+            return say(format!("Nothing changed.{skipped}"));
+        }
+
+        let store = &self.app.store;
+        store
+            .import_items(stockpile.id, &loose.items, job.import)
+            .await?;
+        for (name, hull_type_id, quantity, fitted, carried, loaded) in &fits {
+            let fit = NewFit {
+                name,
+                hull_type_id: *hull_type_id,
+                quantity: *quantity,
+                fitted,
+                carried,
+                loaded,
+            };
+            // Replacing has emptied the stockpile already.
+            let import = match job.import {
+                Import::Replace => Import::Add,
+                other => other,
+            };
+            store.import_fit(stockpile.id, &fit, import).await?;
+        }
+        let items = store.items(stockpile.id).await?;
+        let wanted_fits = store.fits(stockpile.id).await?;
         Ok(format!(
-            "{verb} {} item types. **{}** wants {wanted} item types now. `/stockpile check` shows what is missing.{skipped}",
-            resolved.items.len(),
-            stockpile.name
+            "{verb} {} fits and {} item types. **{}** wants {} now. A ship counts for a fit when it is that hull with the fit's modules fitted and its drones and cargo aboard, whatever it is called. Loaded ammunition is not checked. `/stockpile check` shows what is missing.{skipped}",
+            fits.len(),
+            loose.items.len(),
+            stockpile.name,
+            wanted_summary(&items, &wanted_fits)
         ))
     }
 
@@ -794,7 +913,8 @@ impl Handler {
         for stockpile in stockpiles {
             let title = self.describe(stockpile).await?;
             let wanted = self.app.store.items(stockpile.id).await?;
-            if wanted.is_empty() {
+            let fits = self.app.store.fits(stockpile.id).await?;
+            if wanted.is_empty() && fits.is_empty() {
                 sections.push(Section::plain(format!("{title} wants nothing yet.")));
                 continue;
             }
@@ -815,23 +935,58 @@ impl Handler {
                 oldest = Some(oldest.map_or(at, |oldest| oldest.min(at)));
             }
 
-            let stock = self.app.store.stock(&sources.owners, stockpile).await?;
-            let short: Vec<Item> = shopping::missing(&wanted, &stock);
-            sections.push(if short.is_empty() {
-                Section::plain(format!(
-                    "{title}: all {} item types are there.",
-                    wanted.len()
-                ))
+            let store = &self.app.store;
+            let mut stock = store.stock(&sources.owners, stockpile).await?;
+            let plan = if fits.is_empty() {
+                FitPlan::default()
             } else {
-                anything_short = true;
-                Section {
-                    header: format!(
-                        "{title}: {} of {} item types are short.",
-                        short.len(),
-                        wanted.len()
-                    ),
-                    list: format.render(&short),
+                let hulls: Vec<i64> = fits.iter().map(|fit| fit.hull_type_id).collect();
+                let ships = store
+                    .docked_ships(&sources.owners, stockpile, &hulls)
+                    .await?;
+                shopping::plan_fits(&fits, &ships)
+            };
+            // Ships that stand for a fit are spoken for: neither their hulls
+            // nor what is on them counts as stock for anything else.
+            let mut spoken_for = vec![&plan.used_hulls];
+            if stockpile.count_ships {
+                spoken_for.push(&plan.used_contents);
+            }
+            for used in spoken_for {
+                for (type_id, quantity) in used {
+                    if let Some(there) = stock.get_mut(type_id) {
+                        *there = (*there - quantity).max(0);
+                    }
                 }
+            }
+
+            let short: Vec<Item> =
+                shopping::missing(&shopping::combine(&wanted, &plan.needed), &stock);
+            let all_ready = plan
+                .statuses
+                .iter()
+                .all(|status| status.ready >= status.wanted);
+            let mut header = match (short.len(), all_ready) {
+                (0, true) => format!("{title}: everything is there."),
+                (0, false) => {
+                    format!("{title}: all the parts are there, but not every ship is fitted.")
+                }
+                (count, _) => format!("{title}: {count} item types are short."),
+            };
+            for status in &plan.statuses {
+                let _ = write!(
+                    header,
+                    "\n- {}: {} of {} ships ready",
+                    status.name, status.ready, status.wanted
+                );
+                if status.incomplete > 0 {
+                    let _ = write!(header, ", {} more need parts", status.incomplete);
+                }
+            }
+            anything_short = anything_short || !short.is_empty();
+            sections.push(Section {
+                header,
+                list: format.render(&short),
             });
         }
 
@@ -1002,6 +1157,29 @@ impl Handler {
                     )
                 })
                 .collect(),
+            "fit" => {
+                let wanted = optional_text(command, "name").unwrap_or_default();
+                let by_id = wanted
+                    .strip_prefix('#')
+                    .and_then(|id| id.parse::<i64>().ok());
+                let stockpile = store
+                    .stockpiles(user, command.guild_id)
+                    .await?
+                    .into_iter()
+                    .find(|stockpile| match by_id {
+                        Some(id) => stockpile.id == id,
+                        None => stockpile.name.eq_ignore_ascii_case(wanted),
+                    });
+                match stockpile {
+                    Some(stockpile) => store
+                        .fits(stockpile.id)
+                        .await?
+                        .into_iter()
+                        .map(|fit| (fit.name.clone(), fit.name))
+                        .collect(),
+                    None => Vec::new(),
+                }
+            }
             "character" => store
                 .characters_of(user)
                 .await?
@@ -1059,15 +1237,114 @@ struct Comparison {
     anything_short: bool,
 }
 
+/// Whether pasted EFT fits become fits to match ships against, or just the
+/// items they are made of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FitsAs {
+    Parts,
+    Ships,
+}
+
+/// What to do with a pasted list.
+#[derive(Debug, Clone, Copy)]
+struct PasteJob {
+    /// Want everything this many times.
+    times: i64,
+    import: Import,
+    fits: FitsAs,
+}
+
+/// Reads the options of `/stockpile paste`.
+fn paste_job(command: &CommandInteraction) -> PasteJob {
+    PasteJob {
+        times: integer(command, "times").unwrap_or(1),
+        import: match optional_text(command, "mode") {
+            Some("higher") => Import::KeepHigher,
+            Some("replace") => Import::Replace,
+            _ => Import::Add,
+        },
+        fits: match optional_text(command, "fits") {
+            Some("ships") => FitsAs::Ships,
+            _ => FitsAs::Parts,
+        },
+    }
+}
+
+/// What a stockpile wants, as text that `/stockpile paste` reads back: the
+/// items first, then each fit with its count, its modules one per line
+/// (with a loaded charge after a comma) and its drones and cargo as `Name x5`.
+fn wanted_text(items: &[Item], fits: &[Fit]) -> String {
+    let mut text = Format::Multibuy.render(items);
+    for fit in fits {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        let _ = writeln!(text, "[{}, {}] x{}", fit.hull_name, fit.name, fit.wanted);
+        // Which module a charge was loaded in is not kept, and does not
+        // matter: each charge goes behind some module.
+        let mut charges = fit
+            .loaded
+            .iter()
+            .flat_map(|charge| (0..charge.quantity).map(move |_| &charge.name));
+        for module in &fit.fitted {
+            for _ in 0..module.quantity {
+                match charges.next() {
+                    Some(charge) => {
+                        let _ = writeln!(text, "{}, {charge}", module.name);
+                    }
+                    None => {
+                        let _ = writeln!(text, "{}", module.name);
+                    }
+                }
+            }
+        }
+        text.push_str(&Format::Eft.render(&fit.carried));
+    }
+    text
+}
+
+/// How much a stockpile wants, in words.
+fn wanted_summary(items: &[Item], fits: &[Fit]) -> String {
+    match (items.len(), fits.len()) {
+        (items, 0) => format!("{items} item types"),
+        (0, fits) => format!("{fits} fits"),
+        (items, fits) => format!("{fits} fits and {items} item types"),
+    }
+}
+
+/// The sentence about names that were not found, or nothing.
+fn skipped_note(unknown: &[String]) -> String {
+    if unknown.is_empty() {
+        return String::new();
+    }
+    let names: Vec<&str> = unknown
+        .iter()
+        .take(MAX_LISTED)
+        .map(String::as_str)
+        .collect();
+    let more = match unknown.len().saturating_sub(names.len()) {
+        0 => String::new(),
+        more => format!(" and {more} more"),
+    };
+    format!(
+        "\nEVE knows no item with these names, so I skipped them: {}{more}",
+        names.join(", ")
+    )
+}
+
 /// The window to paste items into. Its id carries what to do with the text.
 /// `current` fills the field in, for editing what a stockpile wants.
 fn paste_window(
     stockpile: &Stockpile,
-    times: i64,
-    import: Import,
+    job: PasteJob,
     current: Option<String>,
 ) -> CreateInteractionResponse {
-    let mode = match import {
+    let times = job.times;
+    let fits = match job.fits {
+        FitsAs::Parts => 'p',
+        FitsAs::Ships => 's',
+    };
+    let mode = match job.import {
         Import::Add => 'a',
         Import::KeepHigher => 'h',
         Import::Replace => 'r',
@@ -1083,7 +1360,7 @@ fn paste_window(
         format!("Paste into {}", stockpile.name)
     };
     let modal = CreateModal::new(
-        format!("paste:{}:{times}:{mode}", stockpile.id),
+        format!("paste:{}:{times}:{mode}:{fits}", stockpile.id),
         cut(&title, 45),
     )
     .components(vec![CreateActionRow::InputText(field)]);
@@ -1114,15 +1391,6 @@ fn may_manage(member: Option<&Member>) -> bool {
     member
         .and_then(|member| member.permissions)
         .is_some_and(|permissions| permissions.administrator() || permissions.manage_guild())
-}
-
-/// Reads the `mode` option of `/stockpile paste`.
-fn import_mode(command: &CommandInteraction) -> Import {
-    match optional_text(command, "mode") {
-        Some("higher") => Import::KeepHigher,
-        Some("replace") => Import::Replace,
-        _ => Import::Add,
-    }
 }
 
 /// A headline with, optionally, a list under it.
@@ -1393,6 +1661,11 @@ fn commands() -> Vec<CreateCommand> {
                             .add_string_choice("Keep the higher number: 5000 + 5000 wants 5000", "higher")
                             .add_string_choice("Replace the whole list", "replace"),
                     )
+                    .add_sub_option(
+                        string("fits", "What an EFT fit in the list stands for")
+                            .add_string_choice("As parts: just want the items of the fit (default)", "parts")
+                            .add_string_choice("As fitted ships: want ships with the fit's modules, drones and cargo", "ships"),
+                    )
                     .add_sub_option(CreateCommandOption::new(
                         CommandOptionType::Attachment,
                         "file",
@@ -1409,6 +1682,20 @@ fn commands() -> Vec<CreateCommand> {
                     )
                     .add_sub_option(
                         integer("quantity", "How many you want there, 0 to remove the item")
+                            .min_int_value(0)
+                            .required(true),
+                    ),
+            )
+            .add_option(
+                sub("fit", "Set how many ships of a fit a stockpile wants")
+                    .add_sub_option(stockpile("The stockpile"))
+                    .add_sub_option(
+                        string("fit", "Name of the fit")
+                            .set_autocomplete(true)
+                            .required(true),
+                    )
+                    .add_sub_option(
+                        integer("quantity", "How many ships, 0 to remove the fit")
                             .min_int_value(0)
                             .required(true),
                     ),
@@ -1554,6 +1841,47 @@ impl EventHandler for Handler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copied_text_reads_back_as_the_same_fits() {
+        let item = |type_id, name: &str, quantity| Item {
+            type_id,
+            name: name.to_owned(),
+            quantity,
+        };
+        let fit = Fit {
+            name: "Fleet Ferox".to_owned(),
+            hull_type_id: 16227,
+            hull_name: "Ferox".to_owned(),
+            wanted: 10,
+            fitted: vec![item(3082, "250mm Railgun II", 7)],
+            loaded: vec![item(230, "Antimatter Charge M", 7)],
+            carried: vec![
+                item(2488, "Hornet EC-300", 5),
+                item(28668, "Nanite Repair Paste", 1),
+            ],
+        };
+        let text = wanted_text(&[item(34, "Tritanium", 500)], &[fit]);
+        let pasted = parse::parse_fits(&text);
+
+        assert_eq!(pasted.loose.len(), 1);
+        assert_eq!(pasted.loose[0].quantity, 500);
+        let read = &pasted.fits[0];
+        assert_eq!(
+            (read.hull.as_str(), read.name.as_str(), read.count),
+            ("Ferox", "Fleet Ferox", 10)
+        );
+        let count = |part| read.lines.iter().filter(|line| line.part == part).count();
+        assert_eq!(count(Part::Fitted), 7, "one line per fitted module");
+        assert_eq!(count(Part::Loaded), 7, "each with its charge");
+        let extras: Vec<(&str, i64)> = read
+            .lines
+            .iter()
+            .filter(|line| line.part == Part::Carried)
+            .map(|line| (line.line.name.as_str(), line.line.quantity))
+            .collect();
+        assert_eq!(extras, [("Hornet EC-300", 5), ("Nanite Repair Paste", 1)]);
+    }
 
     #[test]
     fn the_guide_fits_in_one_message() {

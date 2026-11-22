@@ -20,45 +20,140 @@ impl Line {
     }
 }
 
+/// A fit from a pasted list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PastedFit {
+    pub hull: String,
+    pub name: String,
+    /// How many ships of the fit, from `[Hull, Name] x10`. 1 without it.
+    pub count: i64,
+    pub lines: Vec<FitLine>,
+}
+
+/// One line under a fit's header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FitLine {
+    pub line: Line,
+    pub part: Part,
+}
+
+/// What a line of a fit is on the ship.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Part {
+    /// A module, rig or subsystem in a slot: a line without a quantity.
+    Fitted,
+    /// Drones and cargo: a line with a quantity.
+    Carried,
+    /// The charge loaded in a module: what follows the comma.
+    Loaded,
+}
+
+/// A pasted list, with the fits in it kept apart.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Pasted {
+    /// The lines before the first fit.
+    pub loose: Vec<Line>,
+    pub fits: Vec<PastedFit>,
+}
+
+impl Pasted {
+    /// Everything as plain lines: per fit its hull and all its lines, times
+    /// the fit's count.
+    pub fn into_lines(self) -> Vec<Line> {
+        let mut lines = self.loose;
+        for fit in self.fits {
+            lines.push(Line {
+                name: fit.hull,
+                quantity: fit.count,
+                whole: None,
+            });
+            lines.extend(fit.lines.into_iter().map(|fit_line| Line {
+                quantity: fit_line.line.quantity.saturating_mul(fit.count),
+                ..fit_line.line
+            }));
+        }
+        lines
+    }
+}
+
 /// Parses pasted text into names and quantities. Names are not checked here.
 ///
 /// Understood per line: `Name 500`, `Name x500`, `500 Name`, `500x Name`, a
 /// tab separated copy from the game (`Name<tab>500<tab>...`), and EFT fits,
-/// where `[Hull, Fit name]` counts the hull and `Module, Charge` counts both.
-pub fn parse(text: &str) -> Vec<Line> {
-    let mut lines = Vec::new();
-    let mut in_fit = false;
+/// where `[Hull, Fit name]` starts a fit and `Module, Charge` counts both.
+///
+/// Each EFT fit is kept together. Everything after a
+/// `[Hull, Fit name]` header belongs to that fit, up to the next header.
+/// `[Hull, Fit name] x10` wants ten of them.
+pub fn parse_fits(text: &str) -> Pasted {
+    let mut pasted = Pasted::default();
 
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        if let Some(inner) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+        if let Some((inner, after)) = line.strip_prefix('[').and_then(|l| l.split_once(']')) {
             // `[Empty High slot]` and the like carry nothing.
-            if let Some((hull, _fit_name)) = inner.split_once(',') {
-                in_fit = true;
-                lines.push(Line::one(hull));
+            if let Some((hull, name)) = inner.split_once(',') {
+                let after = after.trim();
+                let count = quantity(after.strip_prefix(['x', 'X']).unwrap_or(after));
+                pasted.fits.push(PastedFit {
+                    hull: hull.trim().to_owned(),
+                    name: name.trim().to_owned(),
+                    count: count.unwrap_or(1),
+                    lines: Vec::new(),
+                });
             }
             continue;
         }
 
+        let Some(fit) = pasted.fits.last_mut() else {
+            pasted.loose.push(if line.contains('\t') {
+                tabbed(line)
+            } else {
+                plain(line)
+            });
+            continue;
+        };
         if line.contains('\t') {
-            lines.push(tabbed(line));
+            fit.lines.push(FitLine {
+                line: tabbed(line),
+                part: Part::Carried,
+            });
             continue;
         }
-
         let line = line.strip_suffix("/offline").map_or(line, str::trim_end);
-        if let Some((name, quantity)) = counted(line) {
-            lines.push(Line {
-                name: name.to_owned(),
-                quantity,
-                whole: Some(line.to_owned()),
+        if counted(line).is_some() {
+            fit.lines.push(FitLine {
+                line: plain(line),
+                part: Part::Carried,
             });
-        } else if let Some((module, charge)) = line.split_once(", ").filter(|_| in_fit) {
-            lines.push(Line::one(module));
-            lines.push(Line::one(charge));
+        } else if let Some((module, charge)) = line.split_once(", ") {
+            fit.lines.push(FitLine {
+                line: Line::one(module),
+                part: Part::Fitted,
+            });
+            fit.lines.push(FitLine {
+                line: Line::one(charge),
+                part: Part::Loaded,
+            });
         } else {
-            lines.push(Line::one(line));
+            fit.lines.push(FitLine {
+                line: Line::one(line),
+                part: Part::Fitted,
+            });
         }
     }
-    lines
+    pasted
+}
+
+/// A line outside the tab separated format: a name with or without a quantity.
+fn plain(line: &str) -> Line {
+    match counted(line) {
+        Some((name, quantity)) => Line {
+            name: name.to_owned(),
+            quantity,
+            whole: Some(line.to_owned()),
+        },
+        None => Line::one(line),
+    }
 }
 
 /// A line copied from the game: the name, then usually the quantity, then
@@ -116,6 +211,10 @@ fn quantity(text: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(text: &str) -> Vec<Line> {
+        parse_fits(text).into_lines()
+    }
 
     fn pairs(text: &str) -> Vec<(String, i64)> {
         parse(text)
@@ -188,6 +287,60 @@ mod tests {
                 ("Caldari Navy Antimatter Charge M", 2000),
             ],
         );
+    }
+
+    #[test]
+    fn fits_are_kept_apart() {
+        let pasted = parse_fits(
+            "Nanite Repair Paste 500\n\
+             [Ferox, Fleet Ferox] x10\n\
+             Magnetic Field Stabilizer II\n\
+             250mm Railgun II, Caldari Navy Antimatter Charge M\n\
+             [Empty Med slot]\n\
+             Hornet EC-300 x5\n\
+             [Scimitar, Logi]\n\
+             Large Remote Shield Booster II",
+        );
+        assert_eq!(pasted.loose.len(), 1);
+        assert_eq!(pasted.fits.len(), 2);
+
+        let ferox = &pasted.fits[0];
+        assert_eq!(
+            (ferox.hull.as_str(), ferox.name.as_str(), ferox.count),
+            ("Ferox", "Fleet Ferox", 10)
+        );
+        let fitted: Vec<&str> = ferox
+            .lines
+            .iter()
+            .filter(|l| l.part == Part::Fitted)
+            .map(|l| l.line.name.as_str())
+            .collect();
+        assert_eq!(fitted, ["Magnetic Field Stabilizer II", "250mm Railgun II"]);
+        assert_eq!(
+            ferox.lines.len(),
+            4,
+            "the loaded charge and the drones come on top"
+        );
+        let part_of = |name: &str| {
+            ferox
+                .lines
+                .iter()
+                .find(|l| l.line.name == name)
+                .map(|l| l.part)
+        };
+        assert_eq!(
+            part_of("Caldari Navy Antimatter Charge M"),
+            Some(Part::Loaded)
+        );
+        assert_eq!(part_of("Hornet EC-300"), Some(Part::Carried));
+        assert_eq!(pasted.fits[1].count, 1);
+
+        let flat = pasted.into_lines();
+        let hornets = flat
+            .iter()
+            .find(|l| l.name == "Hornet EC-300")
+            .map(|l| l.quantity);
+        assert_eq!(hornets, Some(50), "five per ship, ten ships");
     }
 
     #[test]

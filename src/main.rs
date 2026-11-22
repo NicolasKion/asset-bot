@@ -8,6 +8,7 @@ mod discord;
 mod esi;
 mod monitor;
 mod parse;
+mod sde;
 mod shopping;
 mod sso;
 mod store;
@@ -51,7 +52,7 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("opening the database {}", config.database_path.display()))?;
     let sso = Sso::connect(http.clone(), &config).await?;
-    let app = Arc::new(App::new(config, store, sso, Esi::new(http)));
+    let app = Arc::new(App::new(config, store, sso, Esi::new(http.clone())));
 
     let listener = TcpListener::bind(app.config.bind_addr)
         .await
@@ -72,6 +73,7 @@ async fn main() -> Result<()> {
         result = client.start() => result.context("Discord connection ended")?,
         result = axum::serve(listener, router) => result.context("web server ended")?,
         () = monitor.run() => {}
+        () = sde::run(Arc::clone(&app), http) => {}
         _ = tokio::signal::ctrl_c() => info!("shutting down"),
         _ = terminate.recv() => info!("shutting down"),
     }

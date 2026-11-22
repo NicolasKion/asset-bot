@@ -24,7 +24,21 @@ All answers are private unless you ask for a public one.
 
 From a fit, the hull, modules, drones and cargo count. A charge loaded in a module counts once.
 
+### Fits as fitted ships
+
+With `fits: As fitted ships` on `/stockpile paste`, a fit is not broken up into parts. The stockpile then wants that many ships of the fit, and `/stockpile check` looks at the assembled ships at the location:
+
+- A ship has a fit when it is the fit's hull, every module, rig and subsystem of the fit is fitted to it, and the fit's drones and cargo are aboard. The name of the ship does not matter, so renaming one changes nothing. What else is on it does not matter either.
+- Ammunition loaded in modules is not looked at, since ESI is unreliable about it. It is only on the shopping list for a ship that is missing entirely. Ammunition in the cargo is checked like any other cargo.
+- A ship of the right hull that lacks something counts as incomplete, and only what it lacks goes on the shopping list. A ship that is not there at all needs the hull and the whole fit.
+- Loose hulls and modules at the location count towards what is needed, so the list only has what you really have to buy.
+- If two fits use the same hull, a ship goes to the fit that asks for the most among those it fully has.
+
+`[Ferox, Fleet Ferox] x10` in the pasted text wants ten, the same as `times:10`. `/stockpile fit name:<stockpile> fit:<fit> quantity:<n>` changes the number later, 0 removes the fit. Lines before the first fit are plain items; everything after a fit's header belongs to that fit. In a fit, a line without a quantity is a fitted module, `Module, Charge` is a module with its loaded charge, and a line with a quantity (`Hornet EC-300 x5`) is drones or cargo.
+
 When the EVE login of a character stops working (password change, app removed from the account, character moved), the bot sends its owner a direct message, and says so if no working character is left. It notices this when a command needs the login, and otherwise checks every six hours. The message only arrives if the owner shares a server with the bot and allows direct messages from it.
+
+The names of all items come from CCP's static data API (`sde.evetech.net`). The bot loads them at the first start, which takes a moment, and looks for a new version every twelve hours.
 
 ESI updates asset lists once an hour, so the bot reads them at most that often. What you bought five minutes ago can still show as missing.
 
